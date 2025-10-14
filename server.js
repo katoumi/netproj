@@ -1,92 +1,119 @@
-// server.js - NetProj backend (Express + Socket.IO)
-// WARNING: runs system ping/traceroute. Use locally and carefully.
-const express = require('express');
-const http = require('http');
-const path = require('path');
-const { spawn } = require('child_process');
-const { Server } = require('socket.io');
-const rateLimit = require('express-rate-limit');
+// server.js - NetProj backend
+// ----------------------------------------------------------
+import express from "express";
+import http from "http";
+import { Server as SocketIO } from "socket.io";
+import cors from "cors";
+import { spawn } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
 
+// Basic setup
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
-
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// rate limiter to avoid abuse
-const limiter = rateLimit({
-  windowMs: 15 * 1000, // 15 sec
-  max: 30,
-  message: 'Too many requests - slow down'
+const io = new SocketIO(server, {
+  cors: {
+    origin: "*", // allow all (safe for demo/project)
+    methods: ["GET", "POST"],
+  },
 });
-app.use('/api/', limiter);
 
-app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
+// Get __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// simple hostname/IP validator (restricts special characters)
-const TARGET_RE = /^[A-Za-z0-9_.:-]{1,255}$/;
+// Middleware
+app.use(cors());
+app.use(express.static(path.join(__dirname, "public")));
 
-function spawnCommand(cmd, args, onLine, onDone){
-  try{
-    const proc = spawn(cmd, args);
-    proc.stdout.on('data', (chunk) => {
-      const s = chunk.toString();
-      s.split(/\r?\n/).forEach(line => { if(line) onLine(line); });
-    });
-    proc.stderr.on('data', (chunk) => {
-      const s = chunk.toString();
-      s.split(/\r?\n/).forEach(line => { if(line) onLine(line); });
-    });
-    proc.on('close', (code) => onDone(code));
-    proc.on('error', (err) => onDone(err));
-    return proc;
-  }catch(err){
-    onDone(err);
-  }
+// Health route
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok", time: new Date().toISOString() });
+});
+
+// Helper to sanitize targets
+function sanitizeTarget(target) {
+  if (!target || typeof target !== "string") return null;
+  target = target.trim();
+  if (!/^[A-Za-z0-9_.:-]{1,255}$/.test(target)) return null;
+  return target;
 }
 
-io.on('connection', socket => {
-  socket.emit('server', { msg: 'welcome' });
+// --- SOCKET HANDLERS --- //
+io.on("connection", (socket) => {
+  console.log("Client connected:", socket.id);
 
-  socket.on('start', ({ opId, command, payload }) => {
-    if(!opId || !command) return;
-    const { target } = payload || {};
-    if(!target || !TARGET_RE.test(target)){
-      socket.emit('stream', { opId, line: 'Invalid target', rtt: null });
-      socket.emit('done', { opId });
+  socket.on("start", (msg) => {
+    const { opId, command, payload } = msg;
+    if (!opId || !command || !payload?.target) return;
+
+    const target = sanitizeTarget(payload.target);
+    if (!target) {
+      socket.emit("done", { opId, error: "Invalid target" });
       return;
     }
 
-    if(command === 'ping'){
-      const count = parseInt(payload.count) || 4;
-      const args = process.platform === 'win32' ? ['-n', String(count), target] : ['-c', String(count), target];
-      const cmd = 'ping';
-      spawnCommand(cmd, args,
-        (line) => {
-          let rtt = null;
-          const m = line.match(/time[=<]\s*([0-9.]+)\s*ms/i);
-          if(m) rtt = parseFloat(m[1]);
-          socket.emit('stream', { opId, line, rtt });
-        },
-        (exit) => socket.emit('done', { opId, exit })
-      );
-    } else if(command === 'traceroute'){
-      let cmd, args;
-      if(process.platform === 'win32'){ cmd = 'tracert'; args = ['-d', target]; }
-      else { cmd = 'traceroute'; args = ['-n', '-m', String(payload.maxHops || 30), target]; }
-      spawnCommand(cmd, args,
-        (line) => socket.emit('stream', { opId, line }),
-        (exit) => socket.emit('done', { opId, exit })
-      );
+    if (command === "ping") {
+      runPing(socket, opId, target, payload.count || 4);
+    } else if (command === "traceroute") {
+      runTraceroute(socket, opId, target);
     } else {
-      socket.emit('stream', { opId, line: 'Unknown command', rtt: null });
-      socket.emit('done', { opId });
+      socket.emit("done", { opId, error: "Unknown command" });
     }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Client disconnected:", socket.id);
   });
 });
 
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// --- EXECUTION HELPERS --- //
+function runPing(socket, opId, target, count) {
+  const cmd = process.platform === "win32" ? "ping" : "ping";
+  const args = process.platform === "win32" ? ["-n", count, target] : ["-c", count, target];
 
+  try {
+    const proc = spawn(cmd, args);
+    proc.stdout.on("data", (data) => {
+      const line = data.toString();
+      socket.emit("stream", { opId, line });
+      const match = line.match(/time[=<]([\d.]+)/);
+      if (match) socket.emit("stream", { opId, rtt: parseFloat(match[1]) });
+    });
+    proc.stderr.on("data", (data) => {
+      socket.emit("stream", { opId, line: data.toString() });
+    });
+    proc.on("close", (code) => {
+      socket.emit("done", { opId, code });
+    });
+  } catch (err) {
+    socket.emit("done", { opId, error: err.message });
+  }
+}
+
+function runTraceroute(socket, opId, target) {
+  const cmd = process.platform === "win32" ? "tracert" : "traceroute";
+  const args = [target];
+
+  try {
+    const proc = spawn(cmd, args);
+    proc.stdout.on("data", (data) => {
+      const line = data.toString();
+      socket.emit("stream", { opId, line });
+    });
+    proc.stderr.on("data", (data) => {
+      socket.emit("stream", { opId, line: data.toString() });
+    });
+    proc.on("close", (code) => {
+      socket.emit("done", { opId, code });
+    });
+  } catch (err) {
+    socket.emit("done", { opId, error: err.message });
+  }
+}
+
+// --- START SERVER --- //
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('NetProj server listening on http://localhost:' + PORT));
+server.listen(PORT, () => {
+  console.log(`✅ NetProj backend running on port ${PORT}`);
+});
