@@ -1,9 +1,8 @@
 // dashboard app.js - NetProj
-// ----------------------------------------------------
 const BACKEND_URL =
   location.hostname === "localhost"
     ? "http://localhost:3000"
-    : "https://netproj.onrender.com"; // <--- CHANGE THIS TO YOUR RENDER URL
+    : "https://netproject-nzcf.onrender.com"; 
 
 const socket = io(BACKEND_URL, { transports: ["websocket"] });
 
