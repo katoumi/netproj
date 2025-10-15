@@ -115,5 +115,5 @@ function runTraceroute(socket, opId, target) {
 // --- START SERVER --- //
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`✅ NetProj backend running on port ${PORT}`);
+  console.log(` NetProj backend running on port ${PORT}`);
 });
